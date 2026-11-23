@@ -19,6 +19,17 @@ from flask import (
     url_for,
 )
 
+from provenance import (
+    PROVENANCE_LABELS,
+    PROVENANCE_TONE,
+    ProvenanceConflict,
+    ProvenanceError,
+    build_report,
+    merge_event_entries,
+    merge_link_entries,
+    parse_event_csv,
+    parse_link_csv,
+)
 from solver import (
     BREAKS,
     INFEASIBLE,
@@ -29,7 +40,8 @@ from solver import (
 )
 
 MAX_CSV_BYTES = 2 * 1024 * 1024
-MAX_REQUEST_BYTES = MAX_CSV_BYTES + 512 * 1024  # multipart overhead
+# The import form carries one CSV; the provenance form may carry two.
+MAX_REQUEST_BYTES = 2 * MAX_CSV_BYTES + 512 * 1024  # multipart overhead
 MAX_READINGS = 20_000
 
 HEADER_ALIASES = {
@@ -109,6 +121,47 @@ CREATE TABLE IF NOT EXISTS approvals (
     lower_ms INTEGER,
     upper_ms INTEGER,
     status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Evidence for the timing-source audit.  Both tables are append-only: a
+-- supplement may add rows but never rewrite an existing relation.
+CREATE TABLE IF NOT EXISTS timing_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    event_id TEXT NOT NULL,
+    upstream_event_id TEXT,
+    raw_device_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (session_id, event_id),
+    CHECK ((upstream_event_id IS NULL) <> (raw_device_id IS NULL))
+);
+
+CREATE TABLE IF NOT EXISTS reading_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reading_id INTEGER NOT NULL REFERENCES readings(id),
+    event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (reading_id)
+);
+
+CREATE TABLE IF NOT EXISTS provenance_uploads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    kind TEXT NOT NULL,
+    added_links INTEGER NOT NULL DEFAULT 0,
+    added_events INTEGER NOT NULL DEFAULT 0,
+    unchanged_rows INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provenance_judgements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
+    upload_id INTEGER NOT NULL REFERENCES provenance_uploads(id),
+    lap_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 """
@@ -357,6 +410,43 @@ STATUS_TONE = {
 }
 
 
+def _load_provenance_evidence(connection: sqlite3.Connection, session_id: int):
+    """Return ``(links_by_reading_id, events_by_event_id)`` for a batch."""
+
+    links = {
+        row["reading_id"]: row["event_id"]
+        for row in connection.execute(
+            """
+            SELECT reading_links.reading_id, reading_links.event_id
+            FROM reading_links
+            JOIN readings ON readings.id = reading_links.reading_id
+            JOIN laps ON laps.id = readings.lap_id
+            WHERE laps.session_id = ?
+            """,
+            (session_id,),
+        )
+    }
+    events = {
+        row["event_id"]: {
+            "event_id": row["event_id"],
+            "upstream_event_id": row["upstream_event_id"],
+            "raw_device_id": row["raw_device_id"],
+        }
+        for row in connection.execute(
+            "SELECT * FROM timing_events WHERE session_id = ?", (session_id,)
+        )
+    }
+    return links, events
+
+
+def _reading_choices(laps: list[dict]) -> dict[tuple[int, str], int]:
+    return {
+        (lap["lap_number"], reading["source"]): reading["id"]
+        for lap in laps
+        for reading in lap["readings"]
+    }
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__)
     app.config.from_mapping(
@@ -401,11 +491,16 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.context_processor
     def inject_helpers():
-        return {"status_labels": STATUS_LABELS, "status_tone": STATUS_TONE}
+        return {
+            "status_labels": STATUS_LABELS,
+            "status_tone": STATUS_TONE,
+            "provenance_labels": PROVENANCE_LABELS,
+            "provenance_tone": PROVENANCE_TONE,
+        }
 
     @app.errorhandler(413)
     def payload_too_large(_error):
-        return render_index("上传内容过大（CSV 上限 2 MB）", 413)
+        return render_index("上传内容过大（单个 CSV 上限 2 MB）", 413)
 
     @app.get("/healthz")
     def healthz():
@@ -544,6 +639,17 @@ def create_app(test_config: dict | None = None) -> Flask:
             """,
             (session_id,),
         ).fetchall()
+        links, events = _load_provenance_evidence(connection, session_id)
+        provenance = build_report(laps, links, events)
+        uploads = connection.execute(
+            """
+            SELECT * FROM provenance_uploads
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (session_id,),
+        ).fetchall()
         return (
             render_template(
                 "review.html",
@@ -551,6 +657,8 @@ def create_app(test_config: dict | None = None) -> Flask:
                 laps=laps,
                 conclusion=conclusion,
                 approvals=approvals,
+                provenance=provenance,
+                provenance_uploads=uploads,
                 error=error,
             ),
             status_code,
@@ -698,6 +806,184 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_review(session_id, exc.message, 409)
 
         flash("核定已保存，结论已按最新核定重算。", "good")
+        return redirect(url_for("review_session", session_id=session_id))
+
+    @app.post("/sessions/<int:session_id>/provenance")
+    def add_provenance(session_id: int):
+        connection = get_db()
+        session = connection.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None:
+            return render_template("not_found.html"), 404
+
+        uploads = [
+            field
+            for field in ("link_csv", "event_csv")
+            if request.files.get(field) is not None
+            and request.files[field].filename
+        ]
+        if not uploads:
+            return render_review(
+                session_id, "请至少选择一份要补交的 CSV（关联表或事件登记表）", 400
+            )
+
+        raw_files: dict[str, bytes] = {}
+        for field in uploads:
+            raw = request.files[field].read(MAX_CSV_BYTES + 1)
+            if len(raw) > MAX_CSV_BYTES:
+                return render_review(session_id, "CSV 文件过大（上限 2 MB）", 413)
+            raw_files[field] = raw
+
+        try:
+            link_entries = (
+                parse_link_csv(raw_files["link_csv"])
+                if "link_csv" in raw_files
+                else None
+            )
+            event_entries = (
+                parse_event_csv(raw_files["event_csv"])
+                if "event_csv" in raw_files
+                else None
+            )
+        except ProvenanceConflict as exc:
+            return render_review(session_id, str(exc), 409)
+        except ProvenanceError as exc:
+            return render_review(session_id, str(exc), 400)
+
+        try:
+            with _transaction(connection):
+                # Re-read evidence inside the write transaction so the merge
+                # and every affected lap's judgement come from one snapshot.
+                session = connection.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if session is None:
+                    raise ProvenanceConflict("该复核批次已不存在")
+
+                laps = _readings_by_lap(connection, session_id)
+                by_key = _reading_choices(laps)
+                links, events = _load_provenance_evidence(connection, session_id)
+                timestamp = _now()
+
+                added_links: list[dict] = []
+                added_events: list[dict] = []
+                unchanged = 0
+                upload_id: int | None = None
+
+                if link_entries is not None:
+                    for entry in link_entries:
+                        key = (entry["lap"], entry["source"])
+                        if key not in by_key:
+                            raise ProvenanceError(
+                                f"第 {entry['lap']} 圈 {entry['source']} "
+                                "在该批次中不存在对应读数"
+                            )
+                    # Map the reading-id keyed store onto (lap, source) keys.
+                    existing_keyed = {
+                        key: links[reading_id]
+                        for key, reading_id in by_key.items()
+                        if reading_id in links
+                    }
+                    _merged, new_keyed, same_keyed = merge_link_entries(
+                        existing_keyed, link_entries
+                    )
+                    added_links = new_keyed
+                    unchanged += same_keyed
+                    upload_id = connection.execute(
+                        """
+                        INSERT INTO provenance_uploads
+                            (session_id, kind, added_links, added_events,
+                             unchanged_rows, created_at)
+                        VALUES (?, 'link', ?, 0, ?, ?)
+                        """,
+                        (session_id, len(new_keyed), same_keyed, timestamp),
+                    ).lastrowid
+                    for entry in new_keyed:
+                        connection.execute(
+                            """
+                            INSERT INTO reading_links (reading_id, event_id, created_at)
+                            VALUES (?, ?, ?)
+                            """,
+                            (
+                                by_key[(entry["lap"], entry["source"])],
+                                entry["event_id"],
+                                timestamp,
+                            ),
+                        )
+
+                if event_entries is not None:
+                    _merged_events, new_events, same_events = merge_event_entries(
+                        events, event_entries
+                    )
+                    added_events = new_events
+                    unchanged += same_events
+                    upload_id = connection.execute(
+                        """
+                        INSERT INTO provenance_uploads
+                            (session_id, kind, added_links, added_events,
+                             unchanged_rows, created_at)
+                        VALUES (?, 'event', 0, ?, ?, ?)
+                        """,
+                        (session_id, len(new_events), same_events, timestamp),
+                    ).lastrowid
+                    for entry in new_events:
+                        connection.execute(
+                            """
+                            INSERT INTO timing_events
+                                (session_id, event_id, upstream_event_id,
+                                 raw_device_id, created_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                session_id,
+                                entry["event_id"],
+                                entry.get("upstream_event_id"),
+                                entry.get("raw_device_id"),
+                                timestamp,
+                            ),
+                        )
+
+                # Recompute the whole provenance picture, so a supplement that
+                # resolves an upstream event also updates every lap whose
+                # chain runs through it.
+                links_after, events_after = _load_provenance_evidence(
+                    connection, session_id
+                )
+                report = build_report(laps, links_after, events_after)
+                for lap in report.laps:
+                    connection.execute(
+                        """
+                        INSERT INTO provenance_judgements
+                            (session_id, upload_id, lap_number, status, detail,
+                             created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            upload_id,
+                            lap.lap_number,
+                            lap.status,
+                            lap.detail,
+                            timestamp,
+                        ),
+                    )
+        except ProvenanceConflict as exc:
+            return render_review(session_id, str(exc), 409)
+        except ProvenanceError as exc:
+            return render_review(session_id, str(exc), 400)
+
+        parts = []
+        if link_entries is not None:
+            parts.append(f"关联表新增 {len(added_links)} 条")
+        if event_entries is not None:
+            parts.append(f"事件登记新增 {len(added_events)} 条")
+        if unchanged:
+            parts.append(f"重复且一致 {unchanged} 条未改动")
+        flash(
+            "计时来源证据已补交：" + "，".join(parts) + "。相关各圈判定已一起更新。",
+            "good",
+        )
         return redirect(url_for("review_session", session_id=session_id))
 
     return app

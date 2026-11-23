@@ -109,6 +109,137 @@
   </section>
 
   <section class="card">
+    <h2>计时来源核查</h2>
+    <p class="muted">一份关联表按「圈号、计时来源、事件号」把主备读数接到计时事件；另一份事件登记表为每个事件登记上游事件号或原始设备号。系统沿上游追到原始事件，再比较同一圈主备读数是否落在同一台设备上。两表可在后续补交；一次补交后所有受影响圈一起重算。</p>
+
+    {% set same_count = provenance.laps | selectattr('status', 'equalto', 'SAME_DEVICE') | list | length %}
+    {% set two_count = provenance.laps | selectattr('status', 'equalto', 'TWO_DEVICES') | list | length %}
+    {% set missing_count = provenance.laps | selectattr('status', 'equalto', 'INSUFFICIENT') | list | length %}
+    <div class="facts">
+      <div><dt>已关联读数</dt><dd>{{ provenance.linked_readings }} / {{ provenance.total_readings }}</dd></div>
+      <div><dt>主备同一设备</dt><dd>{{ same_count }} 圈</dd></div>
+      <div><dt>主备两台设备</dt><dd>{{ two_count }} 圈</dd></div>
+      <div><dt>证据不全</dt><dd>{{ missing_count }} 圈</dd></div>
+      <div><dt>已登记事件</dt><dd>{{ provenance.events | length }}</dd></div>
+    </div>
+
+    <form method="post" action="{{ url_for('add_provenance', session_id=session.id) }}" enctype="multipart/form-data" class="grid-form">
+      <label>读数关联表 CSV（圈号, 计时来源, 事件号）
+        <input type="file" name="link_csv" accept=".csv,text/csv">
+      </label>
+      <label>事件登记表 CSV（事件号, 上游事件号 或 原始设备号）
+        <input type="file" name="event_csv" accept=".csv,text/csv">
+      </label>
+      <button type="submit">补交证据</button>
+    </form>
+    <p class="muted">可以只交一份。新增行会追加；重复且一致的行忽略；改写已登记关系、同一行给出两个不同事件、或合并后事件链成环，都会整次拒收并保留原有证据和判定。</p>
+
+    {% if provenance.laps %}
+      <table class="laps">
+        <thead>
+          <tr>
+            <th>圈</th>
+            <th>主计时来源链</th>
+            <th>备计时来源链</th>
+            <th>判定</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for lap in provenance.laps %}
+          <tr>
+            <td class="num">{{ lap.lap_number }}</td>
+            <td>
+              {% if lap.primary %}
+                <div>{{ lap.primary.source }} · {{ lap.primary.cumulative_ms }} ms</div>
+                <div class="chain">{{ lap.primary.chain_text }}</div>
+              {% else %}
+                <span class="muted">无主计时读数</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if lap.backup %}
+                <div>{{ lap.backup.source }} · {{ lap.backup.cumulative_ms }} ms</div>
+                <div class="chain">{{ lap.backup.chain_text }}</div>
+              {% else %}
+                <span class="muted">无备计时读数</span>
+              {% endif %}
+            </td>
+            <td>
+              <span class="pill tone-{{ provenance_tone.get(lap.status, 'neutral') }}">{{ provenance_labels.get(lap.status, lap.status) }}</span>
+              <div class="chain">{{ lap.detail }}</div>
+              {% for reading in lap.extra_readings %}
+                <div class="chain">{{ reading.source }}：{{ reading.chain_text }}</div>
+              {% endfor %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+
+    {% if provenance.cross_lap %}
+      <h3>跨圈引用同一原始事件</h3>
+      <p class="muted">下列原始事件被不同圈引用，可能是一次冲线触发被转发到了多个圈。</p>
+      {% for reference in provenance.cross_lap %}
+        <div class="cross-ref">
+          <div>
+            <strong>原始事件 {{ reference.original_event_id }}</strong>
+            {% if reference.raw_device_id %}<span class="muted">· 设备 {{ reference.raw_device_id }}</span>{% endif %}
+          </div>
+          <table>
+            <thead><tr><th>圈</th><th>来源</th><th>累计</th><th>来源链</th></tr></thead>
+            <tbody>
+            {% for entry in reference.entries %}
+              <tr>
+                <td class="num">{{ entry.lap_number }}</td>
+                <td>{{ entry.source }}</td>
+                <td class="num">{{ entry.cumulative_ms }} ms</td>
+                <td class="chain">{{ entry.chain_text }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    {% if provenance.events %}
+      <details class="hint">
+        <summary>已登记事件（{{ provenance.events | length }}）</summary>
+        <table>
+          <thead><tr><th>事件号</th><th>登记关系</th></tr></thead>
+          <tbody>
+          {% for event in provenance.events %}
+            <tr><td>{{ event.event_id }}</td><td class="chain">{{ event.relation_text }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+    {% endif %}
+
+    {% if provenance_uploads %}
+      <details class="hint">
+        <summary>补交记录</summary>
+        <table>
+          <thead><tr><th>#</th><th>类型</th><th>新增关联</th><th>新增事件</th><th>重复一致</th><th>时间</th></tr></thead>
+          <tbody>
+          {% for upload in provenance_uploads %}
+            <tr>
+              <td class="num">{{ upload.id }}</td>
+              <td>{{ '关联表' if upload.kind == 'link' else '事件登记表' }}</td>
+              <td class="num">{{ upload.added_links }}</td>
+              <td class="num">{{ upload.added_events }}</td>
+              <td class="num">{{ upload.unchanged_rows }}</td>
+              <td class="muted">{{ upload.created_at }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+    {% endif %}
+  </section>
+
+  <section class="card">
     <h2>最近核定记录</h2>
     {% if approvals %}
       <table>

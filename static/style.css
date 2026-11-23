@@ -176,6 +176,23 @@ tbody tr:last-child td { border-bottom: none; }
 .inline-form { display: inline-flex; gap: 0.4rem; align-items: center; margin: 0.15rem 0.2rem 0.15rem 0; flex-wrap: wrap; }
 .inline-form select { max-width: 15rem; }
 
+.chain {
+  font-size: 0.82rem;
+  color: var(--muted);
+  word-break: break-all;
+  margin-top: 0.15rem;
+}
+
+.cross-ref {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  margin-top: 0.8rem;
+  background: var(--bg);
+}
+
+.cross-ref table { margin-top: 0.4rem; }
+
 .hint { margin-top: 0.9rem; }
 .hint summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
 .hint pre {
